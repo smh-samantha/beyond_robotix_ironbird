@@ -43,5 +43,6 @@
         "cinttypes": "cpp",
         "typeinfo": "cpp",
         "stm32h7xx_hal_fdcan.h": "c"
-    }
+    },
+    "cmake.ignoreCMakeListsMissing": true
 }
