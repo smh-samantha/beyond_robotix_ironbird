@@ -1,172 +1,196 @@
+// main.cpp  (MicroNode: MCP23008 provides CS for 2x BMP5xx; RAW SPI chip-id test)
+// I2C: PA9(SCL), PA10(SDA)
+// SPI: PA5(SCK), PA6(MISO), PA7(MOSI)
+// MCP23008 @ 0x20..0x27, GP0/GP1 used as ACTIVE-LOW CS lines
+
 #include <Arduino.h>
-#include <dronecan.h>
+#include <Wire.h>
+#include <SPI.h>
+
 #include <IWatchdog.h>
 #include <app.h>
-#include <vector>
-#include <simple_dronecanmessages.h>
-#include <SPI.h>
-#include "Adafruit_BMP5xx.h"
 
-// DroneCAN Parameters (Unchanged)
-std::vector<DroneCAN::parameter> custom_parameters = {
-    { "NODEID", UAVCAN_PROTOCOL_PARAM_VALUE_INTEGER_VALUE, 100,  0, 127 },
-    { "PARM_1", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-    { "PARM_2", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-    { "PARM_3", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-    { "PARM_4", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-    { "PARM_5", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-    { "PARM_6", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-    { "PARM_7", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-};
+// ---- MCP23008 regs ----
+static constexpr uint8_t REG_IODIR = 0x00;
+static constexpr uint8_t REG_GPIO  = 0x09;
+static constexpr uint8_t REG_OLAT  = 0x0A;
 
-// --- DUAL SENSOR CONFIGURATION ---
-static constexpr uint8_t BMP_CS_1 = PA4; // Sensor 1
-static constexpr uint8_t BMP_CS_2 = PB0; // Sensor 2
+static constexpr uint8_t CS0_BIT = 0; // GP0
+static constexpr uint8_t CS1_BIT = 1; // GP1
 
-Adafruit_BMP5xx bmp1;
-Adafruit_BMP5xx bmp2;
+static uint8_t mcp_addr = 0;
+static bool mcp_ok = false;
 
-bool s1_ready = false;
-bool s2_ready = false;
-
-// SPI Hardware Debug Function - Updated for Dual Sensors
-void runRawSPITest() {
-    auto probe = [](uint8_t cs, const char* label) {
-        digitalWrite(cs, LOW);
-        SPI.transfer(0x81); // Read Chip ID command
-        uint8_t id = SPI.transfer(0x00);
-        digitalWrite(cs, HIGH);
-
-        Serial.print("RAW SPI TEST ("); Serial.print(label); Serial.print(") -> ID: 0x");
-        Serial.println(id, HEX);
-        
-        if (id == 0x50) {
-            Serial.print(">>> "); Serial.print(label); Serial.println(" SUCCESS!");
-        } else {
-            Serial.print(">>> "); Serial.print(label); Serial.println(" FAILURE: Check soldering.");
-        }
-    };
-
-    probe(BMP_CS_1, "Sensor 1");
-    probe(BMP_CS_2, "Sensor 2");
+static void print_hex_u8(uint8_t v) {
+  if (v < 16) Serial.print('0');
+  Serial.print(v, HEX);
 }
 
-DroneCAN dronecan;
-uint32_t looptime = 0;
-
-static void onTransferReceived(CanardInstance *ins, CanardRxTransfer *transfer) {
-    switch (transfer->data_type_id) {
-    case UAVCAN_EQUIPMENT_AHRS_MAGNETICFIELDSTRENGTH_ID: {
-        uavcan_equipment_ahrs_MagneticFieldStrength pkt{};
-        uavcan_equipment_ahrs_MagneticFieldStrength_decode(transfer, &pkt);
-        break;
-    }
-    }
-    DroneCANonTransferReceived(dronecan, ins, transfer);
+static void init_i2c_pa9_pa10() {
+  pin_function(digitalPinToPinName(PA9),  STM_PIN_DATA(STM_MODE_AF_OD, GPIO_PULLUP, GPIO_AF4_I2C1));  // SCL
+  pin_function(digitalPinToPinName(PA10), STM_PIN_DATA(STM_MODE_AF_OD, GPIO_PULLUP, GPIO_AF4_I2C1)); // SDA
+  Wire.setSCL(PA9);
+  Wire.setSDA(PA10);
+  Wire.begin();
+  Wire.setClock(100000);
+  Wire.setTimeout(10);
 }
 
-static bool shouldAcceptTransfer(const CanardInstance *ins, uint64_t *out_data_type_signature, uint16_t data_type_id, CanardTransferType transfer_type, uint8_t source_node_id) {
-    if (transfer_type == CanardTransferTypeBroadcast) {
-        switch (data_type_id) {
-        case UAVCAN_EQUIPMENT_AHRS_MAGNETICFIELDSTRENGTH_ID: {
-            *out_data_type_signature = UAVCAN_EQUIPMENT_AHRS_MAGNETICFIELDSTRENGTH_SIGNATURE;
-            return true;
-        }
-        }
-    }
-    return false || DroneCANshoudlAcceptTransfer(ins, out_data_type_signature, data_type_id, transfer_type, source_node_id);
+static bool i2c_probe(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return (Wire.endTransmission(true) == 0);
 }
 
-void setup() {   
-    app_setup();
-    IWatchdog.begin(2000000);
-    Serial.begin(115200);
-    Serial.println("Starting Dual Baro Node!");
-    dronecan.version_major = 1;
-    dronecan.version_minor = 0;
-    dronecan.init(onTransferReceived, shouldAcceptTransfer, custom_parameters, "Beyond Robotix Node");
+static bool mcp_write_reg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(val);
+  return (Wire.endTransmission(true) == 0);
+}
 
-    // --- CRITICAL SPI PIN FIX ---
-    SPI.setSCLK(PA5); 
-    SPI.begin();
-    SPI.setClockDivider(SPI_CLOCK_DIV16);
+static bool mcp_read_reg(uint8_t addr, uint8_t reg, uint8_t &out) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)addr, 1, (int)true) != 1) return false;
+  out = Wire.read();
+  return true;
+}
 
-    // Init both Chip Select pins
-    pinMode(BMP_CS_1, OUTPUT);
-    pinMode(BMP_CS_2, OUTPUT);
-    digitalWrite(BMP_CS_1, HIGH);
-    digitalWrite(BMP_CS_2, HIGH);
+static bool find_mcp(uint8_t &out_addr) {
+  for (uint8_t a = 0x20; a <= 0x27; a++) {
+    IWatchdog.reload();
+    if (i2c_probe(a)) { out_addr = a; return true; }
+  }
+  return false;
+}
 
-    runRawSPITest();
+// Set GP0/GP1 outputs, default HIGH (deselected)
+static bool mcp_init_cs() {
+  if (!find_mcp(mcp_addr)) return false;
 
-    while (true) {
-        const uint32_t now = millis();
+  Serial.print("MCP found @ 0x");
+  print_hex_u8(mcp_addr);
+  Serial.println();
 
-        if (now - looptime > 100) {
-            looptime = now;
-            int32_t vref = __LL_ADC_CALC_VREFANALOG_VOLTAGE(analogRead(AVREF), LL_ADC_RESOLUTION_12B);
-            int32_t cpu_temp = __LL_ADC_CALC_TEMPERATURE(vref, analogRead(ATEMP), LL_ADC_RESOLUTION_12B);
+  // GP0/GP1 outputs, others inputs => 0b11111100 = 0xFC
+  if (!mcp_write_reg(mcp_addr, REG_IODIR, 0xFC)) {
+    Serial.println("IODIR write FAIL");
+    return false;
+  }
 
-            // --- SENSOR 1 PROCESSING ---
-            if (!s1_ready) {
-                if (bmp1.begin(BMP_CS_1, &SPI)) {
-                    Serial.println(">>> Sensor 1 Found!");
-                    bmp1.setPowerMode((bmp5xx_powermode_t)BMP5XX_POWERMODE_NORMAL);
-                    bmp1.setOutputDataRate((bmp5xx_odr_t)BMP5XX_ODR_50_HZ);
-                    s1_ready = true;
-                }
-            } else if (bmp1.performReading()) {
-                // Publish S1 Data to DroneCAN
-                uavcan_equipment_air_data_StaticPressure pkt_p1{};
-                pkt_p1.static_pressure = bmp1.pressure * 100.0f; 
-                sendUavcanMsg(dronecan.canard, pkt_p1);
+  // deselect both CS: GP0=1 GP1=1
+  uint8_t olat = 0xFF;
+  olat |= (1u << CS0_BIT);
+  olat |= (1u << CS1_BIT);
+  if (!mcp_write_reg(mcp_addr, REG_OLAT, olat)) {
+    Serial.println("OLAT write FAIL");
+    return false;
+  }
 
-                uavcan_equipment_device_Temperature pkt_t1{};
-                pkt_t1.temperature = bmp1.temperature + 273.15f; 
-                sendUavcanMsg(dronecan.canard, pkt_t1);
-                
-                // Terminal Print S1
-                Serial.print("S1: "); Serial.print(bmp1.pressure); Serial.print(" hPa, ");
-                Serial.print(bmp1.temperature); Serial.print(" C | ");
-            }
+  // Readback diagnostics
+  uint8_t iodir_rb = 0xAA, olat_rb = 0xAA, gpio_rb = 0xAA;
+  bool ok1 = mcp_read_reg(mcp_addr, REG_IODIR, iodir_rb);
+  bool ok2 = mcp_read_reg(mcp_addr, REG_OLAT,  olat_rb);
+  bool ok3 = mcp_read_reg(mcp_addr, REG_GPIO,  gpio_rb);
 
-            // --- SENSOR 2 PROCESSING ---
-            if (!s2_ready) {
-                if (bmp2.begin(BMP_CS_2, &SPI)) {
-                    Serial.println(">>> Sensor 2 Found!");
-                    bmp2.setPowerMode((bmp5xx_powermode_t)BMP5XX_POWERMODE_NORMAL);
-                    bmp2.setOutputDataRate((bmp5xx_odr_t)BMP5XX_ODR_50_HZ);
-                    s2_ready = true;
-                }
-            } else if (bmp2.performReading()) {
-                // Publish S2 Data to DroneCAN
-                uavcan_equipment_air_data_StaticPressure pkt_p2{};
-                pkt_p2.static_pressure = bmp2.pressure * 100.0f; 
-                sendUavcanMsg(dronecan.canard, pkt_p2);
+  Serial.print("IODIR_rb("); Serial.print(ok1 ? "OK" : "FAIL"); Serial.print(")=0x"); print_hex_u8(iodir_rb);
+  Serial.print("  OLAT_rb("); Serial.print(ok2 ? "OK" : "FAIL"); Serial.print(")=0x"); print_hex_u8(olat_rb);
+  Serial.print("  GPIO_rb("); Serial.print(ok3 ? "OK" : "FAIL"); Serial.print(")=0x"); print_hex_u8(gpio_rb);
+  Serial.println();
 
-                uavcan_equipment_device_Temperature pkt_t2{};
-                pkt_t2.temperature = bmp2.temperature + 273.15f; 
-                sendUavcanMsg(dronecan.canard, pkt_t2);
-                
-                // Terminal Print S2
-                Serial.print("S2: "); Serial.print(bmp2.pressure); Serial.print(" hPa, ");
-                Serial.print(bmp2.temperature); Serial.print(" C | ");
-            }
+  // If this is not 0xFC, stop: we are not controlling pins the way we think.
+  if (!ok1 || iodir_rb != 0xFC) {
+    Serial.println("WARNING: IODIR readback is not 0xFC. MCP type/register-map may not match.");
+    // still return true so you can see CS toggling behavior, but flag it
+  }
 
-            // Summary Info
-            Serial.print("CPU: "); Serial.print(cpu_temp); Serial.println("C");
+  return true;
+}
 
-            // Battery/Health Broadcast
-            uavcan_equipment_power_BatteryInfo pkt_bat{};
-            pkt_bat.voltage = analogRead(PA1);
-            pkt_bat.current = analogRead(PA0);
-            pkt_bat.temperature = cpu_temp;
-            sendUavcanMsg(dronecan.canard, pkt_bat);
-        }
+// Active-low select
+static void mcp_set_cs(bool cs0_active, bool cs1_active) {
+  uint8_t olat = 0xFF;
+  if (cs0_active) olat &= ~(1u << CS0_BIT); else olat |= (1u << CS0_BIT);
+  if (cs1_active) olat &= ~(1u << CS1_BIT); else olat |= (1u << CS1_BIT);
 
-        dronecan.cycle();
-        IWatchdog.reload();
+  (void)mcp_write_reg(mcp_addr, REG_OLAT, olat);
+
+  // Optional readback each time (useful if you suspect it freezes)
+  // uint8_t rb=0; mcp_read_reg(mcp_addr, REG_OLAT, rb);
+}
+
+static void init_spi_pa5_pa6_pa7() {
+  SPI.setSCLK(PA5);
+  SPI.setMISO(PA6);
+  SPI.setMOSI(PA7);
+  SPI.begin();
+}
+
+// BMP5xx: chip id at reg 0x01, read is 0x80 | reg
+static uint8_t bmp_read_chip_id_via_cs(bool use_cs0) {
+  // Ensure only one selected
+  mcp_set_cs(use_cs0, !use_cs0);
+  delayMicroseconds(50);
+
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+  uint8_t id = 0;
+
+  // send read command + reg
+  SPI.transfer(0x80 | 0x01);
+  id = SPI.transfer(0x00);
+
+  SPI.endTransaction();
+
+  // deselect both
+  mcp_set_cs(false, false);
+  delayMicroseconds(50);
+
+  return id;
+}
+
+void setup() {
+  app_setup();
+  IWatchdog.begin(2000000);
+
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println("RAW SPI BMP5xx chip-id test using MCP CS (GP0/GP1)");
+  Serial.println("I2C: PA9/PA10  SPI: PA5/PA6/PA7");
+
+  init_i2c_pa9_pa10();
+  mcp_ok = mcp_init_cs();
+  Serial.print("MCP ok: "); Serial.println(mcp_ok ? "YES" : "NO");
+
+  init_spi_pa5_pa6_pa7();
+  Serial.println("SPI ready.");
+
+  uint32_t t = 0;
+
+  while (true) {
+    const uint32_t now = millis();
+    if (now - t >= 500) {
+      t = now;
+
+      if (!mcp_ok) {
+        Serial.println("No MCP; cannot test CS.");
+      } else {
+        uint8_t id0 = bmp_read_chip_id_via_cs(true);
+        uint8_t id1 = bmp_read_chip_id_via_cs(false);
+
+        Serial.print("CS0 chip-id: 0x"); print_hex_u8(id0);
+        Serial.print("    CS1 chip-id: 0x"); print_hex_u8(id1);
+
+        // BMP580 is commonly 0x50. If you see 0x00 or 0xFF, SPI/CS isn't working.
+        if (id0 == 0x00 || id0 == 0xFF) Serial.print("  (CS0 suspect)");
+        if (id1 == 0x00 || id1 == 0xFF) Serial.print("  (CS1 suspect)");
+        Serial.println();
+      }
     }
+
+    IWatchdog.reload();
+  }
 }
 
 void loop() {}
