@@ -28,6 +28,7 @@ static constexpr uint8_t MCP_REG_GPIO  = 0x09;
 static constexpr uint8_t MCP_REG_OLAT  = 0x0A;
 
 static uint8_t mcp_olat = 0xFF;
+static bool cs_all_low = true;
 
 // --- Force PA9/PA10 to I2C1 AF and bind Wire to them ---
 static void init_i2c_pa9_pa10() {
@@ -106,26 +107,22 @@ static void print_mcp_regs(uint32_t heartbeat_count, uint8_t cs_index) {
   int len = snprintf(
     line,
     sizeof(line),
-    "ALIVE %lu CS=%u IODIR=0x%02X GPIO=0x%02X OLAT=0x%02X",
+    "ALIVE %lu CS=%u IODIR=0x%02X GPIO=0x%02X OLAT=0x%02X MODE=%s",
     (unsigned long)heartbeat_count,
     (unsigned int)cs_index,
     (unsigned int)iodir,
     (unsigned int)gpio,
-    (unsigned int)olat
+    (unsigned int)olat,
+    cs_all_low ? "LOW" : "HIGH"
   );
   if (len > 0 && Serial.availableForWrite() >= len + 2) {
     Serial.println(line);
   }
 }
 
-static void cs_hold_low(uint8_t pin, uint32_t hold_ms) {
-  mcp_olat &= (uint8_t)~(1u << pin);
-  (void)mcp_write_reg(MCP_REG_OLAT, mcp_olat);
-  const uint32_t start = millis();
-  while (millis() - start < hold_ms) {
-    IWatchdog.reload();
-  }
-  mcp_olat |= (uint8_t)(1u << pin);
+static void set_all_cs_low(bool low) {
+  cs_all_low = low;
+  mcp_olat = low ? 0xF0 : 0xFF;
   (void)mcp_write_reg(MCP_REG_OLAT, mcp_olat);
 }
 
@@ -194,7 +191,7 @@ void setup() {
   );
 
   uint8_t cs_index = 0;
-  uint32_t last_pulse_ms = 0;
+  uint32_t last_toggle_ms = 0;
   uint32_t last_diag_ms = 0;
   uint32_t last_scan_ms = 0;
   uint32_t heartbeat_ms = 0;
@@ -218,11 +215,9 @@ void setup() {
       heartbeat_count++;
     }
 
-    if (now - last_pulse_ms >= 500) {
-      last_pulse_ms = now;
-      const uint8_t pin = CS_PINS[cs_index];
-      cs_hold_low(pin, 50);
-      cs_index = (uint8_t)((cs_index + 1) % CS_COUNT);
+    if (now - last_toggle_ms >= 5000) {
+      last_toggle_ms = now;
+      set_all_cs_low(!cs_all_low);
     }
 
     dronecan.cycle();
