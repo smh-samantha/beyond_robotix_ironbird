@@ -1,230 +1,285 @@
-// main.cpp
-// Minimal MCP23008 CS test + DroneCAN boilerplate
-
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_MCP23X08.h>
+#include <dronecan.h>
 #include <IWatchdog.h>
 #include <app.h>
-#include <dronecan.h>
-#include <simple_dronecanmessages.h>
-#include <stdio.h>
 #include <vector>
+#include <simple_dronecanmessages.h>
+#include <SPI.h>
+#include "Adafruit_BMP5xx.h"
+#include <ardupilotmega/mavlink.h>
 
-// -------------------- User config --------------------
-static constexpr uint32_t SERIAL_BAUD = 115200;
-static constexpr uint8_t MCP_I2C_ADDR = 0x20;
-
-static const uint8_t CS_PINS[] = { 0, 1, 2, 3 }; // MCP GPIO0..3
-static constexpr uint8_t CS_COUNT = sizeof(CS_PINS) / sizeof(CS_PINS[0]);
-
-// -------------------- MCP23008 --------------------
-static Adafruit_MCP23X08 mcp;
-
-// MCP23008 registers
-static constexpr uint8_t MCP_REG_IODIR = 0x00;
-static constexpr uint8_t MCP_REG_GPPU  = 0x06;
-static constexpr uint8_t MCP_REG_GPIO  = 0x09;
-static constexpr uint8_t MCP_REG_OLAT  = 0x0A;
-
-static uint8_t mcp_olat = 0xFF;
-static bool cs_all_low = true;
-
-// --- Force PA9/PA10 to I2C1 AF and bind Wire to them ---
-static void init_i2c_pa9_pa10() {
-  pin_function(digitalPinToPinName(PA9),  STM_PIN_DATA(STM_MODE_AF_OD, GPIO_PULLUP, GPIO_AF4_I2C1));  // SCL
-  pin_function(digitalPinToPinName(PA10), STM_PIN_DATA(STM_MODE_AF_OD, GPIO_PULLUP, GPIO_AF4_I2C1));  // SDA
-
-  Wire.setSCL(PA9);
-  Wire.setSDA(PA10);
-
-  Wire.begin();
-  Wire.setClock(100000);
-  Wire.setTimeout(10);
-}
-
-static bool mcp_write_reg(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(MCP_I2C_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  return (Wire.endTransmission(true) == 0);
-}
-
-static bool mcp_read_reg(uint8_t reg, uint8_t &out) {
-  Wire.beginTransmission(MCP_I2C_ADDR);
-  Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom((int)MCP_I2C_ADDR, 1, (int)true) != 1) return false;
-  out = Wire.read();
-  return true;
-}
-
-static bool init_mcp() {
-  if (!mcp.begin_I2C(MCP_I2C_ADDR, &Wire)) return false;
-
-  // GP0..3 outputs, GP4..7 inputs
-  if (!mcp_write_reg(MCP_REG_IODIR, 0xF0)) return false;
-  // Disable pull-ups (inputs will float unless externally pulled)
-  if (!mcp_write_reg(MCP_REG_GPPU, 0x00)) return false;
-  // Default: drive GP0..3 LOW (for test)
-  mcp_olat = 0xF0;
-  if (!mcp_write_reg(MCP_REG_OLAT, mcp_olat)) return false;
-
-  return true;
-}
-
-static void scan_i2c_bus() {
-  char line[64];
-  size_t idx = 0;
-  idx += (size_t)snprintf(line + idx, sizeof(line) - idx, "I2C scan:");
-  for (uint8_t addr = 0x20; addr <= 0x27; addr++) {
-    Wire.beginTransmission(addr);
-    uint8_t err = Wire.endTransmission(true);
-    if (err == 0) {
-      idx += (size_t)snprintf(
-        line + idx,
-        sizeof(line) - idx,
-        " 0x%02X",
-        addr
-      );
-    }
-    IWatchdog.reload();
-  }
-  if (Serial.availableForWrite() >= (int)(idx + 2)) {
-    Serial.println(line);
-  }
-}
-
-static void print_mcp_regs(uint32_t heartbeat_count, uint8_t cs_index) {
-  uint8_t iodir = 0xFF;
-  uint8_t gpio  = 0xFF;
-  uint8_t olat  = 0xFF;
-  (void)mcp_read_reg(MCP_REG_IODIR, iodir);
-  (void)mcp_read_reg(MCP_REG_GPIO, gpio);
-  (void)mcp_read_reg(MCP_REG_OLAT, olat);
-
-  char line[96];
-  int len = snprintf(
-    line,
-    sizeof(line),
-    "ALIVE %lu CS=%u IODIR=0x%02X GPIO=0x%02X OLAT=0x%02X MODE=%s",
-    (unsigned long)heartbeat_count,
-    (unsigned int)cs_index,
-    (unsigned int)iodir,
-    (unsigned int)gpio,
-    (unsigned int)olat,
-    cs_all_low ? "LOW" : "HIGH"
-  );
-  if (len > 0 && Serial.availableForWrite() >= len + 2) {
-    Serial.println(line);
-  }
-}
-
-static void set_all_cs_low(bool low) {
-  cs_all_low = low;
-  mcp_olat = low ? 0xF0 : 0xFF;
-  (void)mcp_write_reg(MCP_REG_OLAT, mcp_olat);
-}
-
-// -------------------- DroneCAN boilerplate --------------------
+// DroneCAN Parameters (Unchanged)
 std::vector<DroneCAN::parameter> custom_parameters = {
-  { "NODEID", UAVCAN_PROTOCOL_PARAM_VALUE_INTEGER_VALUE, 100,  0, 127 },
-  { "PARM_1", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-  { "PARM_2", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-  { "PARM_3", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-  { "PARM_4", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-  { "PARM_5", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-  { "PARM_6", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
-  { "PARM_7", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
+    { "NODEID", UAVCAN_PROTOCOL_PARAM_VALUE_INTEGER_VALUE, 100,  0, 127 },
+    { "PARM_1", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
+    { "PARM_2", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
+    { "PARM_3", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
+    { "PARM_4", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
+    { "PARM_5", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
+    { "PARM_6", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
+    { "PARM_7", UAVCAN_PROTOCOL_PARAM_VALUE_REAL_VALUE,   0.0f, 0.0f, 100.0f },
 };
 
-static DroneCAN dronecan;
+// --- DUAL SENSOR CONFIGURATION ---
+static constexpr uint8_t BMP_CS_1 = PB0;
+static constexpr uint8_t BMP_CS_2 = PB1;
+
+Adafruit_BMP5xx bmp1, bmp2;
+bool s1_ready = false, s2_ready = false;
+
+// SPI Hardware Debug Function - Expanded for 4 Sensors
+void runRawSPITest() {
+    auto probe = [](uint8_t cs, const char* label) {
+        digitalWrite(cs, LOW);
+        SPI.transfer(0x81); // Read Chip ID command
+        uint8_t id = SPI.transfer(0x00);
+        digitalWrite(cs, HIGH);
+
+        Serial.print("RAW SPI TEST ("); Serial.print(label); Serial.print(") -> ID: 0x");
+        Serial.println(id, HEX);
+        
+        if (id == 0x50) {
+            Serial.print(">>> "); Serial.print(label); Serial.println(" SUCCESS!");
+        } else {
+            Serial.print(">>> "); Serial.print(label); Serial.println(" FAILURE: Check soldering.");
+        }
+    };
+
+    probe(BMP_CS_1, "Sensor 1");
+    probe(BMP_CS_2, "Sensor 2");
+}
+
+DroneCAN dronecan;
+uint32_t looptime = 0;
+
+#ifndef MAVLINK_SERIAL
+#define MAVLINK_SERIAL Serial1
+#endif
+
+#ifndef MAVLINK_BAUD
+#define MAVLINK_BAUD 115200
+#endif
+
+#ifndef MAVLINK_SYS_ID
+#define MAVLINK_SYS_ID 1
+#endif
+
+#ifndef MAVLINK_COMP_ID
+#define MAVLINK_COMP_ID 200
+#endif
+
+#ifndef DEBUG_NAMED_VALUES
+#define DEBUG_NAMED_VALUES 0
+#endif
+
+static void mavlinkSendMessage(const mavlink_message_t &msg) {
+    uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
+    const uint16_t len = mavlink_msg_to_send_buffer(buffer, &msg);
+    MAVLINK_SERIAL.write(buffer, len);
+}
+
+static void mavlinkSendBaro(uint8_t sensor_index, float pressure_hpa, float temp_c) {
+    mavlink_message_t msg{};
+    char name[10] = {0};
+
+    snprintf(name, sizeof(name), "BARO580P%u", sensor_index);
+    mavlink_msg_named_value_float_pack(
+        MAVLINK_SYS_ID,
+        MAVLINK_COMP_ID,
+        &msg,
+        millis(),
+        name,
+        pressure_hpa
+    );
+    mavlinkSendMessage(msg);
+
+    snprintf(name, sizeof(name), "BARO580T%u", sensor_index);
+    mavlink_msg_named_value_float_pack(
+        MAVLINK_SYS_ID,
+        MAVLINK_COMP_ID,
+        &msg,
+        millis(),
+        name,
+        temp_c
+    );
+    mavlinkSendMessage(msg);
+
+#if DEBUG_NAMED_VALUES
+    Serial.print("NVF BARO580P");
+    Serial.print(sensor_index);
+    Serial.print("=");
+    Serial.print(pressure_hpa, 1);
+    Serial.print(" BARO580T");
+    Serial.print(sensor_index);
+    Serial.print("=");
+    Serial.println(temp_c, 1);
+#endif
+}
+
+static void formatSensorLine(char *out, size_t out_size, bool has, float pressure_hpa, float temp_c) {
+    if (!has) {
+        snprintf(out, out_size, "OFF");
+        return;
+    }
+
+    char pbuf[8];
+    char tbuf[8];
+    dtostrf(pressure_hpa, 6, 1, pbuf);
+    dtostrf(temp_c, 5, 1, tbuf);
+    snprintf(out, out_size, "P=%s T=%s", pbuf, tbuf);
+}
+
+static void formatPaTempLine(char *out, size_t out_size, bool has, float pressure_pa, float temp_c) {
+    if (!has) {
+        snprintf(out, out_size, "OFF");
+        return;
+    }
+
+    char pbuf[10];
+    char tbuf[8];
+    dtostrf(pressure_pa, 7, 0, pbuf);
+    dtostrf(temp_c, 5, 1, tbuf);
+    snprintf(out, out_size, "P=%sPa T=%s", pbuf, tbuf);
+}
 
 static void onTransferReceived(CanardInstance *ins, CanardRxTransfer *transfer) {
-  switch (transfer->data_type_id) {
+    switch (transfer->data_type_id) {
     case UAVCAN_EQUIPMENT_AHRS_MAGNETICFIELDSTRENGTH_ID: {
-      uavcan_equipment_ahrs_MagneticFieldStrength pkt{};
-      uavcan_equipment_ahrs_MagneticFieldStrength_decode(transfer, &pkt);
-      break;
+        uavcan_equipment_ahrs_MagneticFieldStrength pkt{};
+        uavcan_equipment_ahrs_MagneticFieldStrength_decode(transfer, &pkt);
+        break;
     }
-  }
-  DroneCANonTransferReceived(dronecan, ins, transfer);
+    }
+    DroneCANonTransferReceived(dronecan, ins, transfer);
 }
 
-static bool shouldAcceptTransfer(const CanardInstance *ins,
-                                 uint64_t *out_data_type_signature,
-                                 uint16_t data_type_id,
-                                 CanardTransferType transfer_type,
-                                 uint8_t source_node_id) {
-  if (transfer_type == CanardTransferTypeBroadcast) {
-    switch (data_type_id) {
-      case UAVCAN_EQUIPMENT_AHRS_MAGNETICFIELDSTRENGTH_ID: {
-        *out_data_type_signature = UAVCAN_EQUIPMENT_AHRS_MAGNETICFIELDSTRENGTH_SIGNATURE;
-        return true;
-      }
+static bool shouldAcceptTransfer(const CanardInstance *ins, uint64_t *out_data_type_signature, uint16_t data_type_id, CanardTransferType transfer_type, uint8_t source_node_id) {
+    if (transfer_type == CanardTransferTypeBroadcast) {
+        switch (data_type_id) {
+        case UAVCAN_EQUIPMENT_AHRS_MAGNETICFIELDSTRENGTH_ID: {
+            *out_data_type_signature = UAVCAN_EQUIPMENT_AHRS_MAGNETICFIELDSTRENGTH_SIGNATURE;
+            return true;
+        }
+        }
     }
-  }
-  return false || DroneCANshoudlAcceptTransfer(ins, out_data_type_signature, data_type_id, transfer_type, source_node_id);
-}
- 
-void setup() {
-  app_setup();
-  IWatchdog.begin(2000000);
-  Serial.begin(SERIAL_BAUD);
-  Serial.println("Starting MCP23008 CS test...");
-
-  init_i2c_pa9_pa10();
-
-  if (!init_mcp()) {
-    Serial.println("ERROR: MCP23008 not found on I2C");
-  } else {
-    Serial.println("MCP23008 OK");
-  }
-
-  dronecan.version_major = 1;
-  dronecan.version_minor = 0;
-  dronecan.init(
-    onTransferReceived,
-    shouldAcceptTransfer,
-    custom_parameters,
-    "Beyond Robotix Node"
-  );
-
-  uint8_t cs_index = 0;
-  uint32_t last_toggle_ms = 0;
-  uint32_t last_diag_ms = 0;
-  uint32_t last_scan_ms = 0;
-  uint32_t heartbeat_ms = 0;
-  uint32_t heartbeat_count = 0;
-
-  while (true) {
-    const uint32_t now = millis();
-
-    if (now - last_diag_ms >= 1000) {
-      last_diag_ms = now;
-      print_mcp_regs(heartbeat_count, cs_index);
-    }
-
-    if (now - last_scan_ms >= 10000) {
-      last_scan_ms = now;
-      scan_i2c_bus();
-    }
-
-    if (now - heartbeat_ms >= 1000) {
-      heartbeat_ms = now;
-      heartbeat_count++;
-    }
-
-    if (now - last_toggle_ms >= 5000) {
-      last_toggle_ms = now;
-      set_all_cs_low(!cs_all_low);
-    }
-
-    dronecan.cycle();
-    IWatchdog.reload();
-  }
+    return false || DroneCANshoudlAcceptTransfer(ins, out_data_type_signature, data_type_id, transfer_type, source_node_id);
 }
 
-void loop() {
-  // Use while(true) in setup.
+void setup() {   
+    app_setup();
+    IWatchdog.begin(2000000);
+    Serial.begin(115200);
+    MAVLINK_SERIAL.begin(MAVLINK_BAUD);
+    Serial.println("Starting Quad Baro Node!");
+    dronecan.version_major = 1;
+    dronecan.version_minor = 0;
+    dronecan.init(onTransferReceived, shouldAcceptTransfer, custom_parameters, "Beyond Robotix Node");
+
+    // --- SPI PIN SETUP (MicroNode defaults) ---
+    SPI.setSCLK(PA1);
+    SPI.setMISO(PA6);
+    SPI.setMOSI(PA7);
+    SPI.begin();
+    SPI.setClockDivider(SPI_CLOCK_DIV16);
+
+    // --- MANDATORY: INIT ALL CS PINS TO PREVENT BUS CONTENTION ---
+    uint8_t cs_pins[] = {BMP_CS_1, BMP_CS_2};
+    for(uint8_t p : cs_pins) {
+        pinMode(p, OUTPUT);
+        digitalWrite(p, HIGH); // De-select all sensors immediately
+    }
+
+    runRawSPITest();
+
+    while (true) {
+        const uint32_t now = millis();
+
+        if (now - looptime > 100) {
+            looptime = now;
+            int32_t vref = __LL_ADC_CALC_VREFANALOG_VOLTAGE(analogRead(AVREF), LL_ADC_RESOLUTION_12B);
+            int32_t cpu_temp = __LL_ADC_CALC_TEMPERATURE(vref, analogRead(ATEMP), LL_ADC_RESOLUTION_12B);
+
+            // --- SENSOR 1 ---
+            if (!s1_ready) s1_ready = bmp1.begin(BMP_CS_1, &SPI);
+            const bool s1_has = s1_ready && bmp1.performReading();
+            if (s1_has) {
+                uavcan_equipment_air_data_StaticPressure pkt_p1{.static_pressure = bmp1.pressure};
+                sendUavcanMsg(dronecan.canard, pkt_p1);
+                uavcan_equipment_device_Temperature pkt_t1{
+                    .device_id = 1,
+                    .temperature = bmp1.temperature,
+                    .error_flags = 0
+                };
+                sendUavcanMsg(dronecan.canard, pkt_t1);
+                com_beyondrobotix_baro_BaroPT pkt_baro1{
+                    .sensor_id = 1,
+                    .pressure_pa = bmp1.pressure * 100.0f,
+                    .temperature_c = bmp1.temperature
+                };
+                sendUavcanMsg(dronecan.canard, pkt_baro1);
+                uavcan_equipment_power_BatteryInfo pkt_bat1{};
+                pkt_bat1.battery_id = 1;
+                pkt_bat1.voltage = bmp1.pressure;
+                pkt_bat1.current = bmp1.temperature;
+                pkt_bat1.temperature = bmp1.temperature;
+                sendUavcanMsg(dronecan.canard, pkt_bat1);
+                mavlinkSendBaro(1, bmp1.pressure, bmp1.temperature);
+            }
+
+            // --- SENSOR 2 ---
+            if (!s2_ready) s2_ready = bmp2.begin(BMP_CS_2, &SPI);
+            const bool s2_has = s2_ready && bmp2.performReading();
+            if (s2_has) {
+                uavcan_equipment_air_data_StaticPressure pkt_p2{.static_pressure = bmp2.pressure };
+                sendUavcanMsg(dronecan.canard, pkt_p2);
+                uavcan_equipment_device_Temperature pkt_t2{
+                    .device_id = 2,
+                    .temperature = bmp2.temperature,
+                    .error_flags = 0
+                };
+                sendUavcanMsg(dronecan.canard, pkt_t2);
+                com_beyondrobotix_baro_BaroPT pkt_baro2{
+                    .sensor_id = 2,
+                    .pressure_pa = bmp2.pressure * 100.0f,
+                    .temperature_c = bmp2.temperature
+                };
+                sendUavcanMsg(dronecan.canard, pkt_baro2);
+                uavcan_equipment_power_BatteryInfo pkt_bat2{};
+                pkt_bat2.battery_id = 2;
+                pkt_bat2.voltage = bmp2.pressure;
+                pkt_bat2.current = bmp2.temperature;
+                pkt_bat2.temperature = bmp2.temperature;
+                sendUavcanMsg(dronecan.canard, pkt_bat2);
+                mavlinkSendBaro(2, bmp2.pressure, bmp2.temperature);
+            }
+
+            char line[256];
+            char s1buf[16], s2buf[16];
+            char dc1buf[24], dc2buf[24];
+            formatSensorLine(s1buf, sizeof(s1buf), s1_has, bmp1.pressure, bmp1.temperature);
+            formatSensorLine(s2buf, sizeof(s2buf), s2_has, bmp2.pressure, bmp2.temperature);
+            formatPaTempLine(dc1buf, sizeof(dc1buf), s1_has, bmp1.pressure * 100.0f, bmp1.temperature);
+            formatPaTempLine(dc2buf, sizeof(dc2buf), s2_has, bmp2.pressure * 100.0f, bmp2.temperature);
+            snprintf(
+                line,
+                sizeof(line),
+                "S1:%-16s | S2:%-16s | NVF1:%-16s | NVF2:%-16s | DC1:%-20s | DC2:%-20s | CPU:%5ldC",
+                s1buf,
+                s2buf,
+                s1buf,
+                s2buf,
+                dc1buf,
+                dc2buf,
+                (long)cpu_temp
+            );
+            Serial.println(line);
+
+            // BatteryInfo is used per sensor above; skip generic CPU packet here.
+        }
+
+        dronecan.cycle();
+        IWatchdog.reload();
+    }
 }
+
+void loop() {}
