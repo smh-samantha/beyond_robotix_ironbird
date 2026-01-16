@@ -72,6 +72,38 @@ uint32_t looptime = 0;
 #define DEBUG_NAMED_VALUES 0
 #endif
 
+static constexpr uint16_t RAW_MSG_ID_STATIC_PRESSURE = 1028;
+static constexpr uint16_t RAW_MSG_ID_TEMPERATURE = 1110;
+
+static uint8_t getRawNodeId() {
+    const uint8_t node_id = canardGetLocalNodeID(&dronecan.canard);
+    if (node_id >= 1 && node_id <= 127) {
+        return node_id;
+    }
+    const float param = dronecan.getParameter("NODEID");
+    if (param >= 1.0f && param <= 127.0f) {
+        return static_cast<uint8_t>(param);
+    }
+    return 1;
+}
+
+static void sendRawCanFloat(uint16_t msg_id, uint8_t node_id, uint8_t sensor_id, float value) {
+    CanardCANFrame frame{};
+    frame.id = (static_cast<uint32_t>(msg_id) << 8) | (node_id & 0x7F);
+    frame.data_len = 5;
+    frame.data[0] = sensor_id;
+    union {
+        float f;
+        uint8_t b[4];
+    } u{};
+    u.f = value;
+    frame.data[1] = u.b[0];
+    frame.data[2] = u.b[1];
+    frame.data[3] = u.b[2];
+    frame.data[4] = u.b[3];
+    CANSend(&frame);
+}
+
 static void mavlinkSendMessage(const mavlink_message_t &msg) {
     uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
     const uint16_t len = mavlink_msg_to_send_buffer(buffer, &msg);
@@ -114,6 +146,16 @@ static void mavlinkSendBaro(uint8_t sensor_index, float pressure_hpa, float temp
     Serial.print("=");
     Serial.println(temp_c, 1);
 #endif
+}
+
+static void sendMagHiRes(uint8_t sensor_id, float pressure_pa, float temp_c) {
+    // Repurpose MagneticFieldStrengthHiRes to carry pressure/temperature as float32s.
+    dronecan_sensors_magnetometer_MagneticFieldStrengthHiRes msg{};
+    msg.sensor_id = sensor_id;
+    msg.magnetic_field_ga[0] = pressure_pa;
+    msg.magnetic_field_ga[1] = temp_c;
+    msg.magnetic_field_ga[2] = 0.0f;
+    sendUavcanMsg(dronecan.canard, msg);
 }
 
 static void formatSensorLine(char *out, size_t out_size, bool has, float pressure_hpa, float temp_c) {
@@ -196,6 +238,7 @@ void setup() {
 
         if (now - looptime > 100) {
             looptime = now;
+            const uint8_t raw_node_id = getRawNodeId();
             int32_t vref = __LL_ADC_CALC_VREFANALOG_VOLTAGE(analogRead(AVREF), LL_ADC_RESOLUTION_12B);
             int32_t cpu_temp = __LL_ADC_CALC_TEMPERATURE(vref, analogRead(ATEMP), LL_ADC_RESOLUTION_12B);
 
@@ -203,54 +246,32 @@ void setup() {
             if (!s1_ready) s1_ready = bmp1.begin(BMP_CS_1, &SPI);
             const bool s1_has = s1_ready && bmp1.performReading();
             if (s1_has) {
-                uavcan_equipment_air_data_StaticPressure pkt_p1{.static_pressure = bmp1.pressure};
-                sendUavcanMsg(dronecan.canard, pkt_p1);
-                uavcan_equipment_device_Temperature pkt_t1{
-                    .device_id = 1,
-                    .temperature = bmp1.temperature,
-                    .error_flags = 0
-                };
-                sendUavcanMsg(dronecan.canard, pkt_t1);
                 com_beyondrobotix_baro_BaroPT pkt_baro1{
                     .sensor_id = 1,
                     .pressure_pa = bmp1.pressure * 100.0f,
                     .temperature_c = bmp1.temperature
                 };
                 sendUavcanMsg(dronecan.canard, pkt_baro1);
-                uavcan_equipment_power_BatteryInfo pkt_bat1{};
-                pkt_bat1.battery_id = 1;
-                pkt_bat1.voltage = bmp1.pressure;
-                pkt_bat1.current = bmp1.temperature;
-                pkt_bat1.temperature = bmp1.temperature;
-                sendUavcanMsg(dronecan.canard, pkt_bat1);
+                sendMagHiRes(1, bmp1.pressure * 100.0f, bmp1.temperature);
                 mavlinkSendBaro(1, bmp1.pressure, bmp1.temperature);
+                sendRawCanFloat(RAW_MSG_ID_STATIC_PRESSURE, raw_node_id, 1, bmp1.pressure * 100.0f);
+                sendRawCanFloat(RAW_MSG_ID_TEMPERATURE, raw_node_id, 1, bmp1.temperature);
             }
 
             // --- SENSOR 2 ---
             if (!s2_ready) s2_ready = bmp2.begin(BMP_CS_2, &SPI);
             const bool s2_has = s2_ready && bmp2.performReading();
             if (s2_has) {
-                uavcan_equipment_air_data_StaticPressure pkt_p2{.static_pressure = bmp2.pressure };
-                sendUavcanMsg(dronecan.canard, pkt_p2);
-                uavcan_equipment_device_Temperature pkt_t2{
-                    .device_id = 2,
-                    .temperature = bmp2.temperature,
-                    .error_flags = 0
-                };
-                sendUavcanMsg(dronecan.canard, pkt_t2);
                 com_beyondrobotix_baro_BaroPT pkt_baro2{
                     .sensor_id = 2,
                     .pressure_pa = bmp2.pressure * 100.0f,
                     .temperature_c = bmp2.temperature
                 };
                 sendUavcanMsg(dronecan.canard, pkt_baro2);
-                uavcan_equipment_power_BatteryInfo pkt_bat2{};
-                pkt_bat2.battery_id = 2;
-                pkt_bat2.voltage = bmp2.pressure;
-                pkt_bat2.current = bmp2.temperature;
-                pkt_bat2.temperature = bmp2.temperature;
-                sendUavcanMsg(dronecan.canard, pkt_bat2);
+                sendMagHiRes(2, bmp2.pressure * 100.0f, bmp2.temperature);
                 mavlinkSendBaro(2, bmp2.pressure, bmp2.temperature);
+                sendRawCanFloat(RAW_MSG_ID_STATIC_PRESSURE, raw_node_id, 2, bmp2.pressure * 100.0f);
+                sendRawCanFloat(RAW_MSG_ID_TEMPERATURE, raw_node_id, 2, bmp2.temperature);
             }
 
             char line[256];
@@ -274,7 +295,6 @@ void setup() {
             );
             Serial.println(line);
 
-            // BatteryInfo is used per sensor above; skip generic CPU packet here.
         }
 
         dronecan.cycle();
